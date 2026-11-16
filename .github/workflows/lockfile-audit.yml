@@ -350,16 +350,34 @@ jobs:
              - `no_packages`: тот же lockfile и статус `no_packages`/«не распознан»;
              - `scanner_error`: тот же lockfile и статус `scanner_error`/«Ошибка OSV-Scanner».
              Открытый `[osv-audit]` issue про другой статус НЕ считается той же проблемой.
-          6. Если подходящая задача есть — обнови её (`gh issue comment`) и/или
-             `gh issue edit`. Не создавай дубликат.
-          7. Если подходящей задачи нет — создай РОВНО ОДНУ задачу:
+          6. Вычисли отпечаток результата:
+             - для `findings`: для каждого элемента `vulnerabilities` из `report.json`
+               сформируй строку `<package>@<version>:<id>`, отсортируй строки,
+               соедини через перевод строки, посчитай SHA-256 и возьми первые
+               16 hex-символов;
+             - для `no_packages` и `scanner_error`: возьми строку
+               `<status>:<lockfile>`, посчитай SHA-256 и первые 16 hex-символов.
+             Сохрани значение в `__REPORT_DIR__/fingerprint.txt` как `FINGERPRINT`.
+          7. Если подходящая задача есть, получи её тело:
+             `gh issue view <number> --repo "$GITHUB_REPOSITORY" --json body --jq .body`
+             и проверь маркер `<!-- osv-audit-fingerprint: <FINGERPRINT> -->`.
+             - Если маркер совпадает: это повтор без новых сведений. НЕ вызывай
+               `gh issue edit` и НЕ добавляй комментарий. Запиши в `triage.md`
+               решение `пропущено (отпечаток совпадает, новых сведений нет)`.
+             - Если маркера нет или он другой: обнови тело `triage.md`, добавив
+               маркер в конец. Комментарий добавляй ТОЛЬКО если изменился статус
+               или набор `package@version:id`. Если изменились только commit, дата
+               или run URL, комментарий не добавляй; запиши
+               `обновлено тело без комментария`.
+          8. Если подходящей задачи нет — создай РОВНО ОДНУ задачу:
              - `findings`: `[osv-audit] Уязвимости в __LOCKFILE__: <N>`
              - `no_packages`: `[osv-audit] Lockfile не распознан: __LOCKFILE__`
              - `scanner_error`: `[osv-audit] Ошибка OSV-Scanner: __LOCKFILE__`
-             Тело задачи — содержимое `triage.md` (через `--body-file`).
-          8. Допиши URL задачи и список найденных задач в `triage.md`.
-          9. Добавь в `$GITHUB_STEP_SUMMARY` 5–10 строк: статус, exit code, число
-             уязвимостей, ссылка на задачу, commit.
+             Тело задачи — `triage.md` с маркером
+             `<!-- osv-audit-fingerprint: <FINGERPRINT> -->` в конце.
+          9. Допиши URL задачи, отпечаток и решение по issue в `triage.md`.
+          10. Добавь в `$GITHUB_STEP_SUMMARY` 5–10 строк: статус, exit code, число
+              уязвимостей, ссылка на задачу, отпечаток, commit.
 
           ЗАПРЕТЫ (нарушение = провал аудита)
           - Не менять `package.json`, `package-lock.json`, `uv.lock` и любые dependency-файлы.

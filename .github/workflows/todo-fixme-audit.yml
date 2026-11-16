@@ -78,22 +78,42 @@ jobs:
           2. Прочитай подходящие текстовые файлы и найди маркеры по критериям.
           3. Сформируй находки и посчитай статистику.
           4. Сначала запиши отчёт в `__REPORT_DIR__/report.md` и `__REPORT_DIR__/report.json`.
-          5. Затем найди существующие задачи и обнови/создай tracking issue.
-          6. После создания issue допиши его URL в `report.json` и в раздел «Существующие задачи» в `report.md`.
+          5. Затем найди существующие задачи и обнови/создай tracking issue с проверкой идемпотентности.
+          6. После работы с issue допиши его URL и решение в `report.json` и `report.md`.
           7. Добавь краткое summary в `$GITHUB_STEP_SUMMARY`.
           8. В конце выполни `git status --porcelain` и убедись, что репозиторий не изменён.
 
-          ПОИСК СУЩЕСТВУЮЩИХ ЗАДАЧ
-          1. Найди tracking issue:
+          ПОИСК СУЩЕСТВУЮЩИХ ЗАДАЧ И ИДЕМПОТЕНТНОСТЬ
+          1. Вычисли отпечаток набора находок из `__REPORT_DIR__/report.json`:
+             - возьми все элементы `findings`, для каждого сформируй строку
+               `<path>:<line>:<marker>`;
+             - отсортируй строки, соедини через перевод строки, посчитай SHA-256;
+             - первые 16 hex-символов — это `FINGERPRINT`.
+             Пример или эквивалентный код на Python:
+             `python3 -c 'import hashlib,json,os;d=json.load(open(os.path.join(os.environ["AUDIT_REPORT_DIR"],"report.json")));items=sorted(f"{x[\"path\"]}:{x[\"line\"]}:{x[\"marker\"]}" for x in d["findings"]);print(hashlib.sha256("\n".join(items).encode()).hexdigest()[:16])'`
+             Сохрани значение в `__REPORT_DIR__/fingerprint.txt`.
+          2. Найди tracking issue:
              `gh issue list --repo "$GITHUB_REPOSITORY" --state all --search 'todo-audit in:title' --json number,title,state,url,updatedAt --limit 20`
-          2. Если есть открытый issue с `todo-audit` в заголовке — обнови его тело:
-             `gh issue edit <number> --repo "$GITHUB_REPOSITORY" --body-file __REPORT_DIR__/report.md`
-             и добавь комментарий с кратким итогом (сколько находок, commit SHA).
-          3. Если открытого issue нет, а находок больше нуля — создай:
+          3. Если есть открытый issue с `todo-audit` в заголовке, получи его тело:
+             `gh issue view <number> --repo "$GITHUB_REPOSITORY" --json body --jq .body`
+             и проверь наличие маркера `<!-- todo-audit-fingerprint: <FINGERPRINT> -->`.
+             - Если маркер совпадает: это повтор без новых сведений. НЕ вызывай
+               `gh issue edit` и НЕ добавляй комментарий. Запиши в отчёт решение
+               `пропущено (отпечаток совпадает, новых сведений нет)`.
+             - Если маркера нет или он другой: обнови тело отчётом, добавив в конец
+               строку `<!-- todo-audit-fingerprint: <FINGERPRINT> -->`. Комментарий
+               добавляй ТОЛЬКО если изменился набор находок (появились/исчезли
+               `path:line:marker`) или статус. Если изменились только commit или дата,
+               комментарий не добавляй; запиши решение `обновлено тело без комментария`.
+          4. Если открытого issue нет, а находок больше нуля — создай РОВНО ОДИН issue:
              `gh issue create --repo "$GITHUB_REPOSITORY" --title "[todo-audit] TODO/FIXME: <N> находок" --body-file __REPORT_DIR__/report.md`
-          4. Если находок ноль — новый issue не создавай. Если открытый tracking issue существует,
-             обнови его пометкой «Находок не обнаружено» и укажи commit SHA.
-          5. В отчёт добавь раздел «Существующие задачи» со ссылками на найденные issues или «не найдено».
+             и добавь в тело маркер `<!-- todo-audit-fingerprint: <FINGERPRINT> -->`.
+          5. Если находок ноль — новый issue не создавай. Если открытый tracking issue
+             существует, обнови его только если в теле ещё нет пометки
+             «Находок не обнаружено» с тем же отпечатком; иначе не меняй.
+          6. В отчёт добавь раздел «Существующие задачи», строку
+             `Отпечаток находок: <FINGERPRINT>` и решение по issue:
+             `создано` / `обновлено` / `пропущено (нет новых сведений)`.
 
           РЕЗУЛЬТАТ
           1. `__REPORT_DIR__/report.md` — отчёт на русском:
