@@ -1,0 +1,427 @@
+name: Lockfile audit (OSV)
+
+on:
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+    inputs:
+      lockfile:
+        description: "Path to the lockfile to scan"
+        required: false
+        default: "package-lock.json"
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: lockfile-audit
+  cancel-in-progress: false
+
+env:
+  OSV_SCANNER_VERSION: v2.7.1
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+      GH_TOKEN: ${{ github.token }}
+      MODEL: opencode/deepseek-v4.1-flash-free
+      LOCKFILE: ${{ github.event.inputs.lockfile || 'package-lock.json' }}
+      REPORT_DIR: ${{ runner.temp }}/osv-audit
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install OpenCode
+        shell: bash
+        run: |
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Install OSV-Scanner (pinned ${{ env.OSV_SCANNER_VERSION }})
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/google/osv-scanner/releases/download/${OSV_SCANNER_VERSION}"
+          curl -fsSL -o osv-scanner_linux_amd64 "${BASE}/osv-scanner_linux_amd64"
+          curl -fsSL -o osv-scanner_SHA256SUMS "${BASE}/osv-scanner_SHA256SUMS"
+          grep ' osv-scanner_linux_amd64$' osv-scanner_SHA256SUMS | sha256sum -c -
+          mv osv-scanner_linux_amd64 osv-scanner
+          chmod +x osv-scanner
+          echo "OSV_BIN=${PWD}/osv-scanner" >> "$GITHUB_ENV"
+          ./osv-scanner --version
+
+      - name: Scan lockfile and save exit code
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p "$REPORT_DIR"
+          echo "Lockfile: $LOCKFILE"
+          set +e
+          "$OSV_BIN" scan source -L "$LOCKFILE" \
+            --format json \
+            --output-file "$REPORT_DIR/osv-results.json" \
+            > "$REPORT_DIR/osv-stdout.log" \
+            2> "$REPORT_DIR/osv-stderr.log"
+          code=$?
+          set -e
+          echo "$code" > "$REPORT_DIR/exit-code.txt"
+          echo "OSV-Scanner exit code: $code"
+          echo "--- stderr ---"
+          cat "$REPORT_DIR/osv-stderr.log" || true
+
+      - name: Classify result and build base report
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import datetime
+          import json
+          import os
+          import re
+
+          report_dir = os.environ["REPORT_DIR"]
+          lockfile = os.environ["LOCKFILE"]
+          scanner_version = os.environ["OSV_SCANNER_VERSION"]
+          server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          commit = os.environ.get("GITHUB_SHA", "")
+          run_id = os.environ.get("GITHUB_RUN_ID", "")
+          run_url = f"{server}/{repo}/actions/runs/{run_id}"
+
+          with open(os.path.join(report_dir, "exit-code.txt"), encoding="utf-8") as f:
+              raw = f.read().strip()
+          exit_code = int(raw) if raw else -1
+
+          results_path = os.path.join(report_dir, "osv-results.json")
+          results = None
+          if os.path.exists(results_path):
+              try:
+                  with open(results_path, encoding="utf-8") as f:
+                      results = json.load(f)
+              except Exception as exc:  # noqa: BLE001
+                  results = None
+                  print(f"WARNING: cannot parse osv-results.json: {exc}")
+
+          packages = []
+          vulnerabilities = []
+          for result in (results or {}).get("results", []):
+              for package_entry in result.get("packages", []):
+                  package = package_entry.get("package", {})
+                  name = package.get("name")
+                  version = package.get("version")
+                  packages.append({
+                      "name": name,
+                      "version": version,
+                      "ecosystem": package.get("ecosystem"),
+                      "purl": package.get("purl"),
+                  })
+                  for group in package_entry.get("groups", []):
+                      ids = group.get("ids", [])
+                      primary = ids[0] if ids else None
+                      vulnerabilities.append({
+                          "package": name,
+                          "version": version,
+                          "id": primary,
+                          "ids": ids,
+                          "aliases": group.get("aliases", []),
+                          "max_severity": group.get("max_severity"),
+                          "osv_url": f"https://osv.dev/vulnerability/{primary}" if primary else None,
+                      })
+
+          seen = set()
+          unique_vulns = []
+          for vuln in vulnerabilities:
+              key = (vuln["package"], vuln["version"], vuln["id"])
+              if key in seen:
+                  continue
+              seen.add(key)
+              unique_vulns.append(vuln)
+          vulnerabilities = unique_vulns
+
+          # OSV-Scanner omits packages without findings from the JSON report,
+          # so the number of recognized packages has to come from the scanner log.
+          detected_packages = 0
+          stderr_path = os.path.join(report_dir, "osv-stderr.log")
+          if os.path.exists(stderr_path):
+              with open(stderr_path, encoding="utf-8", errors="replace") as f:
+                  stderr_text = f.read()
+              counts = [int(m) for m in re.findall(r"found (\d+) packages?", stderr_text)]
+              if counts:
+                  detected_packages = max(counts)
+          packages_found = max(len(packages), detected_packages)
+
+          if exit_code == 0:
+              status = "clean" if packages_found > 0 else "no_packages"
+          elif exit_code == 1:
+              status = "findings" if results is not None and packages else "scanner_error"
+          elif exit_code == 128:
+              status = "no_packages"
+          else:
+              status = "scanner_error"
+
+          if status == "clean" and packages_found == 0:
+              status = "no_packages"
+
+          generated_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+          classification = {
+              "status": status,
+              "exit_code": exit_code,
+              "lockfile": lockfile,
+              "scanner_version": scanner_version,
+              "generated_at": generated_at,
+              "commit": commit,
+              "packages_found": packages_found,
+              "vulnerabilities_found": len(vulnerabilities),
+              "run_url": run_url,
+          }
+          with open(os.path.join(report_dir, "classification.json"), "w", encoding="utf-8") as f:
+              json.dump(classification, f, indent=2, ensure_ascii=False)
+              f.write("\n")
+
+          report = {
+              "generated_at": generated_at,
+              "commit": commit,
+              "repository": repo,
+              "lockfile": lockfile,
+              "scanner_version": scanner_version,
+              "status": status,
+              "exit_code": exit_code,
+              "packages_found": packages_found,
+              "packages": packages,
+              "vulnerabilities_found": len(vulnerabilities),
+              "vulnerabilities": vulnerabilities,
+              "run_url": run_url,
+          }
+          with open(os.path.join(report_dir, "report.json"), "w", encoding="utf-8") as f:
+              json.dump(report, f, indent=2, ensure_ascii=False)
+              f.write("\n")
+
+          titles = {
+              "clean": "Уязвимостей не обнаружено",
+              "findings": "Найдены уязвимости",
+              "no_packages": "Пакеты не распознаны",
+              "scanner_error": "Ошибка сканера",
+          }
+
+          lines = []
+          lines.append("# Аудит lockfile через OSV-Scanner")
+          lines.append("")
+          lines.append(f"- **Репозиторий:** `{repo}`")
+          lines.append(f"- **Дата (UTC):** {generated_at}")
+          lines.append(f"- **Коммит:** `{commit}`")
+          lines.append(f"- **Lockfile:** `{lockfile}`")
+          lines.append(f"- **OSV-Scanner:** `{scanner_version}` (зафиксированная версия)")
+          lines.append(f"- **Run:** {run_url}")
+          lines.append("")
+          lines.append("## Статус")
+          lines.append("")
+          lines.append(f"- **Статус:** `{status}` — {titles[status]}")
+          lines.append(f"- **Код завершения сканера:** `{exit_code}`")
+          lines.append(f"- **Распознано пакетов (по логу сканера):** {packages_found}")
+          lines.append(f"- **Уязвимостей:** {len(vulnerabilities)}")
+          lines.append("")
+
+          if status == "clean":
+              lines.append("Уязвимостей не обнаружено. Пакеты распознаны, исключения не добавлялись.")
+              lines.append("")
+          elif status == "no_packages":
+              lines.append("Сканер не распознал ни одного пакета в указанном lockfile.")
+              lines.append("Аудит считается несостоявшимся: проверь путь к файлу и его формат.")
+              lines.append("")
+          elif status == "scanner_error":
+              lines.append("Сканер завершился с ошибкой. Смотри `osv-stderr.log` и `exit-code.txt`.")
+              lines.append("")
+          else:
+              lines.append("Найдены уязвимые пакеты. Ниже — перечень; решения по обновлению")
+              lines.append("принимает человек, автоматических исправлений не вносилось.")
+              lines.append("")
+
+          if packages:
+              lines.append("## Пакеты с находками")
+              lines.append("")
+              lines.append("| Пакет | Версия | Экосистема |")
+              lines.append("|---|---|---|")
+              for package in packages:
+                  lines.append(f"| `{package['name']}` | `{package['version']}` | {package['ecosystem']} |")
+              lines.append("")
+
+          if vulnerabilities:
+              lines.append("## Уязвимости")
+              lines.append("")
+              lines.append("| Пакет | Версия | ID | Алиасы | Severity | OSV |")
+              lines.append("|---|---|---|---|---|---|")
+              for vuln in vulnerabilities:
+                  aliases = ", ".join(vuln["aliases"]) if vuln["aliases"] else "—"
+                  severity = vuln["max_severity"] or "—"
+                  lines.append(
+                      f"| `{vuln['package']}` | `{vuln['version']}` | {vuln['id']} | {aliases} | {severity} | {vuln['osv_url']} |"
+                  )
+              lines.append("")
+
+          lines.append("## Исключения и ограничения")
+          lines.append("")
+          lines.append("- Исключения (`osv-scanner.toml`, ignore, exclude) не добавлялись.")
+          lines.append("- Зависимости и lockfile не изменялись.")
+          lines.append("- Версия сканера зафиксирована, `latest` не используется.")
+          lines.append("")
+
+          with open(os.path.join(report_dir, "report.md"), "w", encoding="utf-8") as f:
+              f.write("\n".join(lines))
+
+          print(f"status={status} exit_code={exit_code} packages={packages_found} vulnerabilities={len(vulnerabilities)}")
+          PY
+
+      - name: Agent triage
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f "$REPORT_DIR/classification.json" ]; then
+            echo "classification.json missing — skipping agent triage"
+            exit 0
+          fi
+          status=$(python3 -c 'import json, os; print(json.load(open(os.path.join(os.environ["REPORT_DIR"], "classification.json")))["status"])')
+          if [ "$status" = "clean" ]; then
+            echo "status=clean — agent triage not required"
+            exit 0
+          fi
+          echo "status=$status — starting agent triage"
+          PROMPT=$(cat <<'PROMPT_EOF'
+          Ты — аудитор зависимостей и уязвимостей в GitHub-репозитории.
+
+          КОНТЕКСТ
+          - Репозиторий: $GITHUB_REPOSITORY
+          - Lockfile: __LOCKFILE__
+          - Каталог отчёта: __REPORT_DIR__
+          - Версия OSV-Scanner зафиксирована: v2.7.1
+          - Статус уже классифицирован; читай его из __REPORT_DIR__/classification.json
+
+          ЗАДАЧА
+          1. Прочитай `classification.json`, `report.json`, `report.md`, `exit-code.txt`,
+             `osv-stdout.log`, `osv-stderr.log`.
+          2. Проверь корректность классификации:
+             - `clean` — пакеты распознаны, уязвимостей нет;
+             - `findings` — уязвимости найдены;
+             - `no_packages` — сканер не распознал пакеты (exit 128 или 0 пакетов);
+             - `scanner_error` — прочие коды завершения или сбой сканера.
+             Если классификация неверна, зафиксируй это в `triage.md`, но не меняй
+             `classification.json`.
+          3. Сформируй `__REPORT_DIR__/triage.md` на русском:
+             - статус, exit code, lockfile, commit, версия сканера;
+             - что именно обнаружено;
+             - затронутые пакеты и уязвимые версии;
+             - какие версии исправляют проблему, если это известно из OSV;
+             - что должен решить человек;
+             - найденные существующие задачи со ссылками.
+          4. Найди существующие задачи ДО создания новой. Для каждого ID уязвимости
+             (`id`, `ids`, `aliases`) из `report.json` выполни:
+             `gh issue list --repo "$GITHUB_REPOSITORY" --state all --search "<ID> in:title,body" --json number,title,state,url,updatedAt --limit 20`
+             Для каждого затронутого пакета выполни:
+             `gh issue list --repo "$GITHUB_REPOSITORY" --state all --search "<package> in:title,body" --json number,title,state,url,updatedAt --limit 20`
+             Для tracking-задачи выполни:
+             `gh issue list --repo "$GITHUB_REPOSITORY" --state all --search "[osv-audit] in:title" --json number,title,state,url,updatedAt --limit 20`
+          5. Считай задачу «по этой проблеме» существующей, если в её заголовке или теле
+             упоминается тот же ID уязвимости, тот же пакет с той же уязвимой версией,
+             либо это открытый tracking issue `[osv-audit]`.
+          6. Если подходящая задача есть — обнови её (`gh issue comment`) и/или
+             `gh issue edit`. Не создавай дубликат.
+          7. Если подходящей задачи нет — создай РОВНО ОДНУ задачу:
+             - `findings`: `[osv-audit] Уязвимости в __LOCKFILE__: <N>`
+             - `no_packages`: `[osv-audit] Lockfile не распознан: __LOCKFILE__`
+             - `scanner_error`: `[osv-audit] Ошибка OSV-Scanner: __LOCKFILE__`
+             Тело задачи — содержимое `triage.md` (через `--body-file`).
+          8. Допиши URL задачи и список найденных задач в `triage.md`.
+          9. Добавь в `$GITHUB_STEP_SUMMARY` 5–10 строк: статус, exit code, число
+             уязвимостей, ссылка на задачу, commit.
+
+          ЗАПРЕТЫ (нарушение = провал аудита)
+          - Не менять `package.json`, `package-lock.json`, `uv.lock` и любые dependency-файлы.
+          - Не добавлять `osv-scanner.toml`, `ignore`, `exclude`, allowlist и любые исключения.
+          - Не запускать `osv-scanner fix`, `npm audit fix`, `npm update`, `uv lock --upgrade`.
+          - Не выполнять `git add`, `git commit`, `git push`, `gh pr create`.
+          - Не создавать задачу, если аналогичная уже существует.
+          - Любые исправления только описывать в `triage.md` с пометкой
+            «требуется решение человека».
+
+          В конце выполни `git status --porcelain` и убедись, что репозиторий не изменён.
+          PROMPT_EOF
+          )
+          PROMPT=${PROMPT//__REPORT_DIR__/$REPORT_DIR}
+          PROMPT=${PROMPT//__LOCKFILE__/$LOCKFILE}
+          opencode run --auto --model "$MODEL" "$PROMPT"
+
+      - name: Verify repository is unchanged
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::Agent modified the repository"
+            git status --porcelain
+            exit 1
+          fi
+          echo "Repository is clean"
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: osv-audit-report
+          path: ${{ runner.temp }}/osv-audit/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Lockfile audit (OSV-Scanner)"
+            echo
+            if [ -f "$REPORT_DIR/classification.json" ]; then
+              python3 - <<'PY'
+          import json
+          import os
+          data = json.load(open(os.path.join(os.environ["REPORT_DIR"], "classification.json"), encoding="utf-8"))
+          print(f"- Status: `{data['status']}`")
+          print(f"- Exit code: `{data['exit_code']}`")
+          print(f"- Lockfile: `{data['lockfile']}`")
+          print(f"- Packages: {data['packages_found']}")
+          print(f"- Vulnerabilities: {data['vulnerabilities_found']}")
+          print(f"- Scanner: `{data['scanner_version']}`")
+          PY
+            else
+              echo "classification.json не создан."
+            fi
+            echo
+            if [ -f "$REPORT_DIR/report.md" ]; then
+              sed -n '1,80p' "$REPORT_DIR/report.md"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail on no packages or scanner error
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f "$REPORT_DIR/classification.json" ]; then
+            echo "::error::classification.json missing — lockfile audit did not complete"
+            exit 1
+          fi
+          status=$(python3 -c 'import json, os; print(json.load(open(os.path.join(os.environ["REPORT_DIR"], "classification.json")))["status"])')
+          echo "Final status: $status"
+          case "$status" in
+            no_packages|scanner_error)
+              echo "::error::Lockfile audit finished with status: $status"
+              exit 1
+              ;;
+          esac
