@@ -31,7 +31,6 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       MODEL: opencode/deepseek-v4.1-flash-free
       LOCKFILE: ${{ github.event.inputs.lockfile || 'package-lock.json' }}
-      REPORT_DIR: ${{ runner.temp }}/osv-audit
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -61,6 +60,8 @@ jobs:
 
       - name: Scan lockfile and save exit code
         shell: bash
+        env:
+          REPORT_DIR: ${{ runner.temp }}/osv-audit
         run: |
           set -uo pipefail
           mkdir -p "$REPORT_DIR"
@@ -80,6 +81,8 @@ jobs:
 
       - name: Classify result and build base report
         shell: bash
+        env:
+          REPORT_DIR: ${{ runner.temp }}/osv-audit
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -284,6 +287,8 @@ jobs:
       - name: Agent triage
         if: always()
         shell: bash
+        env:
+          REPORT_DIR: ${{ runner.temp }}/osv-audit
         run: |
           set -euo pipefail
           if [ ! -f "$REPORT_DIR/classification.json" ]; then
@@ -383,6 +388,8 @@ jobs:
       - name: Job summary
         if: always()
         shell: bash
+        env:
+          REPORT_DIR: ${{ runner.temp }}/osv-audit
         run: |
           {
             echo "## Lockfile audit (OSV-Scanner)"
@@ -411,6 +418,8 @@ jobs:
       - name: Fail on no packages or scanner error
         if: always()
         shell: bash
+        env:
+          REPORT_DIR: ${{ runner.temp }}/osv-audit
         run: |
           set -euo pipefail
           if [ ! -f "$REPORT_DIR/classification.json" ]; then
