@@ -1,0 +1,6 @@
+.audit/
+todo-fixme-report.md
+todo-fixme-report.json
+__pycache__/
+.venv/
+node_modules/
