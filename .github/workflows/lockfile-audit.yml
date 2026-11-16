@@ -328,16 +328,28 @@ jobs:
              - какие версии исправляют проблему, если это известно из OSV;
              - что должен решить человек;
              - найденные существующие задачи со ссылками.
-          4. Найди существующие задачи ДО создания новой. Для каждого ID уязвимости
-             (`id`, `ids`, `aliases`) из `report.json` выполни:
+          4. Найди существующие задачи ДО создания новой. Сначала определи тип проблемы
+             по статусу:
+             - `findings` — конкретные ID уязвимостей и пакеты;
+             - `no_packages` — lockfile не распознан;
+             - `scanner_error` — сбой сканера.
+             Для `findings` выполни поиск по каждому ID уязвимости (`id`, `ids`, `aliases`)
+             из `report.json`:
              `gh issue list --repo "$GITHUB_REPOSITORY" --state all --search "<ID> in:title,body" --json number,title,state,url,updatedAt --limit 20`
-             Для каждого затронутого пакета выполни:
+             и по каждому затронутому пакету:
              `gh issue list --repo "$GITHUB_REPOSITORY" --state all --search "<package> in:title,body" --json number,title,state,url,updatedAt --limit 20`
-             Для tracking-задачи выполни:
+             Для `no_packages` и `scanner_error` выполни:
+             `gh issue list --repo "$GITHUB_REPOSITORY" --state all --search "<lockfile> in:title,body" --json number,title,state,url,updatedAt --limit 20`
              `gh issue list --repo "$GITHUB_REPOSITORY" --state all --search "[osv-audit] in:title" --json number,title,state,url,updatedAt --limit 20`
-          5. Считай задачу «по этой проблеме» существующей, если в её заголовке или теле
-             упоминается тот же ID уязвимости, тот же пакет с той же уязвимой версией,
-             либо это открытый tracking issue `[osv-audit]`.
+             и отбери только задачи, где есть тот же статус/проблема
+             (`no_packages`, «не распознан», `scanner_error`, «Ошибка OSV-Scanner»)
+             и тот же lockfile.
+          5. Задачу считай «по этой проблеме» существующей только при совпадении:
+             - `findings`: хотя бы один ID уязвимости ИЛИ тот же пакет с той же
+               уязвимой версией, и задача про findings;
+             - `no_packages`: тот же lockfile и статус `no_packages`/«не распознан»;
+             - `scanner_error`: тот же lockfile и статус `scanner_error`/«Ошибка OSV-Scanner».
+             Открытый `[osv-audit]` issue про другой статус НЕ считается той же проблемой.
           6. Если подходящая задача есть — обнови её (`gh issue comment`) и/или
              `gh issue edit`. Не создавай дубликат.
           7. Если подходящей задачи нет — создай РОВНО ОДНУ задачу:
